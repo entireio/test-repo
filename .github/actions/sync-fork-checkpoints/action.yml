@@ -3,13 +3,13 @@ description: 'Import Entire session checkpoint data from a fork after a PR is me
 
 inputs:
   token:
-    description: 'GitHub token with contents:write permission. Defaults to GITHUB_TOKEN (works for public forks).'
+    description: 'GitHub token with contents:write permission. Defaults to GITHUB_TOKEN.'
     required: false
     default: ${{ github.token }}
 
 outputs:
   imported_count:
-    description: 'Number of checkpoint directories imported'
+    description: 'Number of checkpoint commits cherry-picked'
     value: ${{ steps.sync.outputs.imported_count }}
   synced:
     description: 'Whether any checkpoints were synced (true/false)'
@@ -18,15 +18,12 @@ outputs:
 runs:
   using: 'composite'
   steps:
-    - uses: actions/checkout@v4
-      with:
-        fetch-depth: 0
-        token: ${{ inputs.token }}
-
     - name: Sync fork checkpoints
       id: sync
       shell: bash
       env:
+        GH_TOKEN: ${{ inputs.token }}
+        REPO: ${{ github.repository }}
         FORK_URL: ${{ github.event.pull_request.head.repo.clone_url }}
         FORK_FULL_NAME: ${{ github.event.pull_request.head.repo.full_name }}
         IS_FORK: ${{ github.event.pull_request.head.repo.fork }}
@@ -38,6 +35,7 @@ runs:
         set -euo pipefail
 
         BRANCH="entire/checkpoints/v1"
+        ORIGIN_URL="https://x-access-token:${GH_TOKEN}@github.com/${REPO}.git"
 
         echo "synced=false" >> "$GITHUB_OUTPUT"
         echo "imported_count=0" >> "$GITHUB_OUTPUT"
@@ -47,6 +45,16 @@ runs:
           echo "PR is not from a fork. Skipping."
           exit 0
         fi
+
+        # --- Set up a minimal repo (no full checkout, only checkpoints branch) ---
+        WORKDIR=$(mktemp -d)
+        cd "$WORKDIR"
+        git init
+        git remote add origin "$ORIGIN_URL"
+
+        # Fetch only the merge range commits (for reading trailers)
+        git fetch origin "$MERGE_SHA" --depth=100 2>/dev/null || true
+        git fetch origin "$BASE_SHA" --depth=100 2>/dev/null || true
 
         # --- Step 1: Find checkpoint IDs in merged commits ---
         echo "Looking for Entire-Checkpoint trailers in ${BASE_SHA:0:7}..${MERGE_SHA:0:7}"
@@ -59,7 +67,7 @@ runs:
         # Fallback: check original PR commits (handles squash merges that drop trailers)
         if [ -z "$CHECKPOINT_IDS" ]; then
           echo "No trailers in merge range. Checking original PR commits..."
-          git fetch origin "$HEAD_SHA" --depth=50 2>/dev/null || true
+          git fetch "$FORK_URL" "$HEAD_SHA" --depth=50 2>/dev/null || true
           CHECKPOINT_IDS=$(git log --format='%(trailers:key=Entire-Checkpoint,valueonly)' \
             "${BASE_SHA}..${HEAD_SHA}" 2>/dev/null \
             | sed 's/^[[:space:]]*//;s/[[:space:]]*$//' \
@@ -100,10 +108,11 @@ runs:
         fi
 
         # --- Step 4: Find matching commits on fork's checkpoints branch ---
-        # Build a regex pattern matching any of the checkpoint IDs
         GREP_PATTERN=$(printf '%s\n' "${VALID_IDS[@]}" | paste -sd '|' -)
 
-        # Determine which commits are fork-only
+        # Fetch upstream's checkpoints branch to determine fork-only commits
+        git fetch origin "$BRANCH" 2>/dev/null || true
+
         if git rev-parse --verify "refs/remotes/origin/$BRANCH" >/dev/null 2>&1; then
           FORK_RANGE="origin/${BRANCH}..FETCH_HEAD"
         else
@@ -156,7 +165,7 @@ runs:
           exit 0
         fi
 
-        # --- Step 8: Push with retry (handles concurrent PR merges) ---
+        # --- Step 8: Push only the checkpoints branch (with retry for concurrent merges) ---
         MAX_RETRIES=3
         for ATTEMPT in $(seq 1 $MAX_RETRIES); do
           if git push origin "$BRANCH"; then
