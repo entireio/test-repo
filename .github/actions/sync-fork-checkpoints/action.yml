@@ -1,0 +1,170 @@
+name: 'Sync Fork Checkpoints'
+description: 'Import Entire session checkpoint data from a fork after a PR is merged'
+
+inputs:
+  token:
+    description: 'GitHub token with contents:write permission. Defaults to GITHUB_TOKEN (works for public forks).'
+    required: false
+    default: ${{ github.token }}
+
+outputs:
+  imported_count:
+    description: 'Number of checkpoint directories imported'
+    value: ${{ steps.sync.outputs.imported_count }}
+  synced:
+    description: 'Whether any checkpoints were synced (true/false)'
+    value: ${{ steps.sync.outputs.synced }}
+
+runs:
+  using: 'composite'
+  steps:
+    - uses: actions/checkout@v4
+      with:
+        fetch-depth: 0
+        token: ${{ inputs.token }}
+
+    - name: Sync fork checkpoints
+      id: sync
+      shell: bash
+      env:
+        FORK_URL: ${{ github.event.pull_request.head.repo.clone_url }}
+        FORK_FULL_NAME: ${{ github.event.pull_request.head.repo.full_name }}
+        IS_FORK: ${{ github.event.pull_request.head.repo.fork }}
+        MERGE_SHA: ${{ github.event.pull_request.merge_commit_sha }}
+        BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        PR_NUMBER: ${{ github.event.pull_request.number }}
+      run: |
+        set -euo pipefail
+
+        BRANCH="entire/checkpoints/v1"
+
+        echo "synced=false" >> "$GITHUB_OUTPUT"
+        echo "imported_count=0" >> "$GITHUB_OUTPUT"
+
+        # --- Guard: only run for fork PRs ---
+        if [ "$IS_FORK" != "true" ]; then
+          echo "PR is not from a fork. Skipping."
+          exit 0
+        fi
+
+        # --- Step 1: Find checkpoint IDs in merged commits ---
+        echo "Looking for Entire-Checkpoint trailers in ${BASE_SHA:0:7}..${MERGE_SHA:0:7}"
+
+        CHECKPOINT_IDS=$(git log --format='%(trailers:key=Entire-Checkpoint,valueonly)' \
+          "${BASE_SHA}..${MERGE_SHA}" 2>/dev/null \
+          | sed 's/^[[:space:]]*//;s/[[:space:]]*$//' \
+          | grep -v '^$' | sort -u || true)
+
+        # Fallback: check original PR commits (handles squash merges that drop trailers)
+        if [ -z "$CHECKPOINT_IDS" ]; then
+          echo "No trailers in merge range. Checking original PR commits..."
+          git fetch origin "$HEAD_SHA" --depth=50 2>/dev/null || true
+          CHECKPOINT_IDS=$(git log --format='%(trailers:key=Entire-Checkpoint,valueonly)' \
+            "${BASE_SHA}..${HEAD_SHA}" 2>/dev/null \
+            | sed 's/^[[:space:]]*//;s/[[:space:]]*$//' \
+            | grep -v '^$' | sort -u || true)
+        fi
+
+        if [ -z "$CHECKPOINT_IDS" ]; then
+          echo "No Entire-Checkpoint trailers found. Nothing to sync."
+          exit 0
+        fi
+
+        echo "Found checkpoint IDs:"
+        echo "$CHECKPOINT_IDS"
+        echo ""
+
+        # --- Step 2: Fetch fork's checkpoints branch ---
+        echo "Fetching $BRANCH from fork ($FORK_FULL_NAME)..."
+        if ! git fetch "$FORK_URL" "$BRANCH" 2>/dev/null; then
+          echo "Fork has no $BRANCH branch. Nothing to sync."
+          exit 0
+        fi
+        FORK_REF=$(git rev-parse FETCH_HEAD)
+        echo "Fork's $BRANCH is at ${FORK_REF:0:7}"
+
+        # --- Step 3: Identify checkpoint paths to import ---
+        PATHS_TO_IMPORT=()
+        for ID in $CHECKPOINT_IDS; do
+          # Validate checkpoint ID format (12 lowercase hex chars)
+          if ! echo "$ID" | grep -qE '^[0-9a-f]{12}$'; then
+            echo "  Skipping invalid checkpoint ID: $ID"
+            continue
+          fi
+
+          PREFIX="${ID:0:2}"
+          SUFFIX="${ID:2}"
+          DIR="$PREFIX/$SUFFIX"
+
+          if git cat-file -e "${FORK_REF}:${DIR}" 2>/dev/null; then
+            PATHS_TO_IMPORT+=("$DIR")
+            echo "  Will import: $DIR (checkpoint $ID)"
+          else
+            echo "  Not found in fork: $DIR (checkpoint $ID)"
+          fi
+        done
+
+        if [ ${#PATHS_TO_IMPORT[@]} -eq 0 ]; then
+          echo "No checkpoint directories found in fork's $BRANCH. Nothing to sync."
+          exit 0
+        fi
+
+        # --- Step 4: Set up git identity ---
+        git config user.name "github-actions[bot]"
+        git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+        # --- Step 5: Check out or create the local checkpoints branch ---
+        if git rev-parse --verify "refs/remotes/origin/$BRANCH" >/dev/null 2>&1; then
+          echo "Checking out existing $BRANCH..."
+          git checkout -B "$BRANCH" "origin/$BRANCH"
+        else
+          echo "Creating new orphan branch $BRANCH..."
+          git checkout --orphan "$BRANCH"
+          git rm -rf . 2>/dev/null || true
+        fi
+
+        # --- Step 6: Import checkpoint directories from fork ---
+        IMPORTED=0
+        for DIR in "${PATHS_TO_IMPORT[@]}"; do
+          git checkout "$FORK_REF" -- "$DIR"
+          IMPORTED=$((IMPORTED + 1))
+        done
+
+        # Check if anything actually changed (checkpoint may already exist on upstream)
+        if [ -z "$(git status --porcelain)" ]; then
+          echo "All checkpoints already exist on upstream. Nothing to sync."
+          exit 0
+        fi
+
+        # --- Step 7: Commit ---
+        git add .
+        CHECKPOINT_LIST=$(echo "$CHECKPOINT_IDS" | tr '\n' ' ')
+        git commit -m "Import ${IMPORTED} checkpoint(s) from PR #${PR_NUMBER}
+Synced from fork: ${FORK_FULL_NAME}
+Checkpoint IDs: ${CHECKPOINT_LIST}"
+
+        # --- Step 8: Push with retry (handles concurrent PR merges) ---
+        MAX_RETRIES=3
+        for i in $(seq 1 $MAX_RETRIES); do
+          if git push origin "$BRANCH"; then
+            echo ""
+            echo "Successfully imported ${IMPORTED} checkpoint(s) from PR #${PR_NUMBER}"
+            echo "synced=true" >> "$GITHUB_OUTPUT"
+            echo "imported_count=${IMPORTED}" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          if [ "$i" -lt "$MAX_RETRIES" ]; then
+            echo "Push failed (attempt $i/$MAX_RETRIES). Rebasing on remote..."
+            git fetch origin "$BRANCH"
+            git rebase "origin/$BRANCH" || {
+              echo "Rebase failed, trying merge..."
+              git rebase --abort 2>/dev/null || true
+              git merge "origin/$BRANCH" --no-edit
+            }
+          fi
+        done
+
+        echo "::warning::Failed to push checkpoints after $MAX_RETRIES attempts"
+        exit 1
