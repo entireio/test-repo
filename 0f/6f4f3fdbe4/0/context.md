@@ -1,0 +1,8 @@
+# Session Context
+
+## User Prompts
+
+### Prompt 1
+
+can you generate a dummy README.md for this repo, it should explain this is a test repo we use to validate usage of the entire cli and checkpoints+
+
