@@ -114,9 +114,9 @@ runs:
         git fetch origin "$BRANCH" 2>/dev/null || true
 
         if git rev-parse --verify "refs/remotes/origin/$BRANCH" >/dev/null 2>&1; then
-          FORK_RANGE="origin/${BRANCH}..FETCH_HEAD"
+          FORK_RANGE="origin/${BRANCH}..${FORK_REF}"
         else
-          FORK_RANGE="FETCH_HEAD"
+          FORK_RANGE="${FORK_REF}"
         fi
 
         # Find commits referencing our checkpoint IDs, in chronological order
