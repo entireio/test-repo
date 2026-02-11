@@ -84,37 +84,49 @@ runs:
         FORK_REF=$(git rev-parse FETCH_HEAD)
         echo "Fork's $BRANCH is at ${FORK_REF:0:7}"
 
-        # --- Step 3: Identify checkpoint paths to import ---
-        PATHS_TO_IMPORT=()
+        # --- Step 3: Validate checkpoint IDs ---
+        VALID_IDS=()
         for ID in $CHECKPOINT_IDS; do
-          # Validate checkpoint ID format (12 lowercase hex chars)
-          if ! echo "$ID" | grep -qE '^[0-9a-f]{12}$'; then
-            echo "  Skipping invalid checkpoint ID: $ID"
-            continue
-          fi
-
-          PREFIX="${ID:0:2}"
-          SUFFIX="${ID:2}"
-          DIR="$PREFIX/$SUFFIX"
-
-          if git cat-file -e "${FORK_REF}:${DIR}" 2>/dev/null; then
-            PATHS_TO_IMPORT+=("$DIR")
-            echo "  Will import: $DIR (checkpoint $ID)"
+          if echo "$ID" | grep -qE '^[0-9a-f]{12}$'; then
+            VALID_IDS+=("$ID")
           else
-            echo "  Not found in fork: $DIR (checkpoint $ID)"
+            echo "  Skipping invalid checkpoint ID: $ID"
           fi
         done
 
-        if [ ${#PATHS_TO_IMPORT[@]} -eq 0 ]; then
-          echo "No checkpoint directories found in fork's $BRANCH. Nothing to sync."
+        if [ ${#VALID_IDS[@]} -eq 0 ]; then
+          echo "No valid checkpoint IDs found. Nothing to sync."
           exit 0
         fi
 
-        # --- Step 4: Set up git identity ---
+        # --- Step 4: Find matching commits on fork's checkpoints branch ---
+        # Build a regex pattern matching any of the checkpoint IDs
+        GREP_PATTERN=$(printf '%s\n' "${VALID_IDS[@]}" | paste -sd '|' -)
+
+        # Determine which commits are fork-only
+        if git rev-parse --verify "refs/remotes/origin/$BRANCH" >/dev/null 2>&1; then
+          FORK_RANGE="origin/${BRANCH}..FETCH_HEAD"
+        else
+          FORK_RANGE="FETCH_HEAD"
+        fi
+
+        # Find commits referencing our checkpoint IDs, in chronological order
+        COMMITS=$(git log --reverse --format='%H' --extended-regexp \
+          --grep="(${GREP_PATTERN})" "$FORK_RANGE" 2>/dev/null || true)
+
+        if [ -z "$COMMITS" ]; then
+          echo "No matching commits found on fork's $BRANCH. Nothing to sync."
+          exit 0
+        fi
+
+        COMMIT_COUNT=$(echo "$COMMITS" | wc -l | tr -d ' ')
+        echo "Found $COMMIT_COUNT commit(s) to cherry-pick"
+
+        # --- Step 5: Set up git identity ---
         git config user.name "github-actions[bot]"
         git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
 
-        # --- Step 5: Check out or create the local checkpoints branch ---
+        # --- Step 6: Check out or create the local checkpoints branch ---
         if git rev-parse --verify "refs/remotes/origin/$BRANCH" >/dev/null 2>&1; then
           echo "Checking out existing $BRANCH..."
           git checkout -B "$BRANCH" "origin/$BRANCH"
@@ -122,41 +134,41 @@ runs:
           echo "Creating new orphan branch $BRANCH..."
           git checkout --orphan "$BRANCH"
           git rm -rf . 2>/dev/null || true
+          git commit --allow-empty -m "Initialize $BRANCH"
         fi
 
-        # --- Step 6: Import checkpoint directories from fork ---
+        # --- Step 7: Cherry-pick each commit (preserves messages, trailers, authorship) ---
         IMPORTED=0
-        for DIR in "${PATHS_TO_IMPORT[@]}"; do
-          git checkout "$FORK_REF" -- "$DIR"
-          IMPORTED=$((IMPORTED + 1))
-        done
+        while IFS= read -r COMMIT; do
+          [ -z "$COMMIT" ] && continue
+          SUBJECT=$(git log -1 --format='%s' "$COMMIT")
+          echo "  Cherry-picking: $SUBJECT (${COMMIT:0:7})"
+          if git cherry-pick "$COMMIT" --no-edit; then
+            IMPORTED=$((IMPORTED + 1))
+          else
+            git cherry-pick --abort 2>/dev/null || true
+            echo "  Warning: failed to cherry-pick ${COMMIT:0:7}, skipping"
+          fi
+        done <<< "$COMMITS"
 
-        # Check if anything actually changed (checkpoint may already exist on upstream)
-        if [ -z "$(git status --porcelain)" ]; then
-          echo "All checkpoints already exist on upstream. Nothing to sync."
+        if [ "$IMPORTED" -eq 0 ]; then
+          echo "No commits were successfully cherry-picked. Nothing to sync."
           exit 0
         fi
 
-        # --- Step 7: Commit ---
-        git add .
-        CHECKPOINT_LIST=$(echo "$CHECKPOINT_IDS" | tr '\n' ' ')
-        git commit -m "Import ${IMPORTED} checkpoint(s) from PR #${PR_NUMBER}
-Synced from fork: ${FORK_FULL_NAME}
-Checkpoint IDs: ${CHECKPOINT_LIST}"
-
         # --- Step 8: Push with retry (handles concurrent PR merges) ---
         MAX_RETRIES=3
-        for i in $(seq 1 $MAX_RETRIES); do
+        for ATTEMPT in $(seq 1 $MAX_RETRIES); do
           if git push origin "$BRANCH"; then
             echo ""
-            echo "Successfully imported ${IMPORTED} checkpoint(s) from PR #${PR_NUMBER}"
+            echo "Successfully cherry-picked ${IMPORTED} commit(s) from PR #${PR_NUMBER}"
             echo "synced=true" >> "$GITHUB_OUTPUT"
             echo "imported_count=${IMPORTED}" >> "$GITHUB_OUTPUT"
             exit 0
           fi
 
-          if [ "$i" -lt "$MAX_RETRIES" ]; then
-            echo "Push failed (attempt $i/$MAX_RETRIES). Rebasing on remote..."
+          if [ "$ATTEMPT" -lt "$MAX_RETRIES" ]; then
+            echo "Push failed (attempt $ATTEMPT/$MAX_RETRIES). Rebasing on remote..."
             git fetch origin "$BRANCH"
             git rebase "origin/$BRANCH" || {
               echo "Rebase failed, trying merge..."
