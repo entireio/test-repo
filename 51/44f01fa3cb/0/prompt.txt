@@ -1,0 +1,1 @@
+Commit the marker file (synthetic e2e test with git operation)

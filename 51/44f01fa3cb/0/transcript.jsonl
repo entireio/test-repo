@@ -1,0 +1,2 @@
+{"v":1,"agent":"claude-code","cli_version":"0.8.43-nightly.202607180645.c6fc04ffe.0.20260720120550-47b9a3ea21b4+dirty","type":"user","ts":"2026-07-12T09:00:00.000Z","content":[{"text":"Commit the marker file (synthetic e2e test with git operation)"}]}
+{"v":1,"agent":"claude-code","cli_version":"0.8.43-nightly.202607180645.c6fc04ffe.0.20260720120550-47b9a3ea21b4+dirty","type":"assistant","ts":"2026-07-12T09:00:20.000Z","input_tokens":90,"output_tokens":25,"content":[{"text":"Committing now.","type":"text"}]}
