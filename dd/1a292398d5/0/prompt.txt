@@ -1,0 +1,1 @@
+Add a friendly greeting to the README (synthetic e2e test prompt)
