@@ -1,0 +1,4 @@
+{"v":1,"agent":"claude-code","cli_version":"0.9.1-nightly.202608010655.907078158+dirty","type":"user","ts":"2026-07-05T10:00:00Z","content":[{"text":"write a helper script"}]}
+{"v":1,"agent":"claude-code","cli_version":"0.9.1-nightly.202608010655.907078158+dirty","type":"assistant","ts":"2026-07-05T10:02:00Z","id":"m0","input_tokens":100,"output_tokens":50,"content":[{"text":"script written","type":"text"}]}
+{"v":1,"agent":"claude-code","cli_version":"0.9.1-nightly.202608010655.907078158+dirty","type":"user","ts":"2026-07-05T11:00:00Z","content":[{"text":"rename the helper"}]}
+{"v":1,"agent":"claude-code","cli_version":"0.9.1-nightly.202608010655.907078158+dirty","type":"assistant","ts":"2026-07-05T11:02:00Z","id":"m1","input_tokens":101,"output_tokens":51,"content":[{"text":"renamed","type":"text"}]}
